@@ -1,6 +1,7 @@
 // Command ledger runs the pieces of the system as separate processes, so
 // tests can kill them.
 //
+//	ledger demo    [-transfers 5000]   everything in one process, then the checks
 //	ledger relay   -db URL -nats URL
 //	ledger project -db URL -nats URL -name balances
 package main
@@ -22,10 +23,20 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: ledger relay|project [flags]")
+		fmt.Fprintln(os.Stderr, "usage: ledger demo|relay|project [flags]")
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
+	if cmd == "demo" {
+		fs := flag.NewFlagSet("demo", flag.ExitOnError)
+		admin := fs.String("admin", "postgres://postgres@127.0.0.1:5433/postgres?sslmode=disable", "maintenance database URL")
+		n := fs.Int("transfers", 5000, "number of transfers")
+		_ = fs.Parse(args)
+		if err := demo(*admin, *n); err != nil {
+			fail(err)
+		}
+		return
+	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	dbURL := fs.String("db", "postgres://postgres@127.0.0.1:5433/event_ledger?sslmode=disable", "PostgreSQL URL")
 	natsURL := fs.String("nats", "nats://127.0.0.1:4222", "NATS URL")

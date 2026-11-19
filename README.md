@@ -2,7 +2,31 @@
 
 A small double-entry ledger in PostgreSQL that publishes every change as an event to NATS JetStream, through a transactional outbox, to consumers that build read models. The point is the guarantees: no change without its event, no event without its change, and no event applied twice, through crashes at every step.
 
-Built pairing with Claude Code, as a learning project. Runs on this laptop only: PostgreSQL 16 (local test cluster, port 5433) and an embedded NATS server.
+Built pairing with Claude Code, as a learning project. Runs on this laptop only: PostgreSQL 16 (local test cluster, port 5433) and an embedded NATS server (nats-server 2.15, nats.go 1.56, pgx 5.13, Go 1.27).
+
+**What it shows:**
+- **No lost or invented events.** With the transactional outbox, killing the relay at any of four points always ends with each committed event in the stream exactly once. The two dual-write designs lost 30 of 30 or invented 30 of 30 events under the same crashes.
+- **No double-applied events.** Consumers record each event ID in the same transaction as the change and ack after commit. Killed at three points, they always converge; the two planted consumer bugs (ack first, no de-duplication) corrupt every account.
+- **Chaos:** 78,891 events through 87 process kills, 30 database connection cuts and 35 NATS restarts, with the stream and the projection exact.
+- **Two lessons with numbers:** JetStream's deduplication is a window (200 events stored twice once it passed), so consumer-side idempotency is the real guarantee. And a relay that tracks "the highest id published" silently loses a transaction that commits late.
+
+Learning notes and explain-it questions: [LEARN.md](LEARN.md). Interview brief: [`../briefs/event-ledger.md`](../briefs/event-ledger.md).
+
+```text
+writers ──► PostgreSQL (one transaction) ─────────────────────────────┐
+            ledger.accounts / commands / entries   ledger.outbox      │ pg_notify on commit
+                                                       │              ▼
+                                                     relay (advisory-lock leader, standby)
+                                                       │ publish with Nats-Msg-Id = event id
+                                                       ▼
+                               NATS JetStream: LEDGER stream (kept forever, dedup window)
+                                    │ durable pull consumer, explicit ack     │ max deliveries
+                                    ▼                                          ▼
+                     projector: views.processed + balances + statement   LEDGER_ADVISORIES
+                     (one transaction per batch, ack after commit)            │
+                                    │ poison / gave up                         ▼
+                                    └──────────────────────────────► LEDGER_DLQ ──► replay
+```
 
 ## Build log
 
@@ -117,3 +141,31 @@ Results:
 That's 78,891 events through 87 kills, 30 connection cuts and 35 NATS restarts, with 715 duplicates dropped and 458 redeliveries skipped along the way, and nothing lost or applied twice.
 
 **What broke:** the first chaos run reported 0 takeovers, 0 duplicates and 0 skipped redeliveries, which can't be right with 15 kills. The test was wrong, not the system: the supervisor replaced each process's log buffer after the process had started writing to the original. Fixed; the counts above are real.
+
+## Run it
+
+```bash
+go run ./cmd/ledger demo -transfers 5000    # everything in one process, then the checks
+go test ./...                               # about 3 minutes; needs PostgreSQL on 127.0.0.1:5433
+go test ./e2e -run TestChaos -args -chaos-seeds 3 -chaos-duration 30s
+```
+
+The demo leaves the `event_ledger_demo` database on port 5433 for inspection. Example output:
+
+```
+4535 accepted, 465 refused for funds; written in 4.983s, projected by 5.205s
+commit -> stream:      p50   7.3 ms, p99  44.5 ms
+event  -> projection:  p50  58.5 ms, p99 197.9 ms
+stream check:     committed 4575, messages 4575, missing 0 [], phantom 0 [], duplicates 0, unpublished 0, version gaps []
+projection check: 0 accounts differ from the ledger
+```
+
+## What it doesn't do
+
+- **One machine.** One PostgreSQL, one NATS server (not a 3-node JetStream cluster), all on localhost. Network partitions between the pieces weren't tested; restarts and dropped connections were.
+- **Crashes are process kills.** The operating system and disks never failed; PostgreSQL and NATS were never killed mid-write (NATS was shut down and restarted).
+- **Order is per ledger sequence, not per arrival.** After a failed publish, a later event can reach the stream before an earlier one; the projections don't care (sums, and statements sorted by the ledger sequence). A consumer that needs strict per-account order would have to check the version numbers each event carries.
+- **The outbox is never cleaned up.** Real systems delete or partition old published rows.
+- **The stream keeps everything** so projections can be rebuilt. At scale that needs snapshots or compaction.
+- **The relay's advisory lock isn't a fence.** A paused relay can publish after losing it; deduplication makes that harmless here.
+- No CI, not published.
