@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/builtbyshailendra/event-ledger/bus"
+	"github.com/builtbyshailendra/event-ledger/projector"
 	"github.com/builtbyshailendra/event-ledger/relay"
 )
 
@@ -31,6 +32,11 @@ func main() {
 	poll := fs.Duration("poll", time.Second, "relay: longest wait between rounds")
 	noListen := fs.Bool("no-listen", false, "relay: poll only, no LISTEN/NOTIFY")
 	cursor := fs.Bool("cursor", false, "relay: planted bug, track the highest id published")
+	name := fs.String("name", "balances", "project: durable consumer and projection name")
+	ackWait := fs.Duration("ack-wait", 5*time.Second, "project: redeliver after this long without an ack")
+	ackFirst := fs.Bool("ack-before-commit", false, "project: planted bug, ack before writing")
+	noDedup := fs.Bool("no-dedup", false, "project: planted bug, apply redeliveries again")
+	batch := fs.Int("batch", 100, "project: events per transaction")
 	_ = fs.Parse(args)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -51,6 +57,10 @@ func main() {
 	case "relay":
 		r := &relay.Relay{Pool: pool, JS: js, Poll: *poll, NoListen: *noListen, Cursor: *cursor, Log: logf}
 		err = r.Run(ctx)
+	case "project":
+		p := &projector.Projector{Pool: pool, JS: js, Name: *name, AckWait: *ackWait, Batch: *batch, Log: logf,
+			Bugs: projector.Bugs{AckBeforeCommit: *ackFirst, NoDedup: *noDedup}}
+		err = p.Run(ctx)
 	default:
 		fail(fmt.Errorf("unknown command %q", cmd))
 	}

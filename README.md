@@ -53,3 +53,35 @@ In every crash case the final stream holds each committed event exactly once, un
   | outbox | 290 | 290 | each once |
 
   A retry doesn't save dual-write mode: the command is already recorded, so the retry is a no-op and the event is still never sent.
+
+### Step 3: idempotent consumers and projections
+
+`projector/` is a JetStream durable pull consumer (explicit acks, `AckWait`, `MaxDeliver`) that maintains `views.balances` and `views.statement`. Delivery is at-least-once, from two sources: redelivery after a missed ack, and real duplicates in the stream once the relay's deduplication window has passed. So:
+
+- Each event ID is inserted into `views.processed` **in the same transaction** as the change; if it's already there, the event is skipped.
+- The ack goes out **after** the commit. A crash between the two causes a redelivery, which the processed table turns into a no-op.
+- The statement is sorted by the ledger's sequence (the outbox id, carried in a `Ledger-Seq` header), not by arrival, and balances are sums, so the read model doesn't depend on delivery order.
+- A batch is applied in one transaction. If it fails, its events are retried one at a time, so one event that keeps failing doesn't hold back the others.
+- `check.Projection` compares the projection with the write side: every account's balance and number of events (the account version).
+
+Results:
+
+| Test | Result |
+|---|---|
+| 3,000 transfers with relay and projector running (100 events per transaction) | ~2,800 events projected as fast as they were written; event-to-projection p50 50 ms, p99 289 ms; backlog peaked at 149 |
+| Same, one transaction per event | p50 3.2 s, p99 5.3 s; backlog peaked at 2,159 |
+| Projector killed before commit (2nd batch of 50) | 50 applied; restart redelivers and applies the rest; matches the ledger |
+| Killed after commit, before ack | 100 applied; restart gets the 50 unacked again and **skips all 50 as duplicates**; matches |
+| Killed after ack | 100 applied; nothing redelivered; matches |
+| Stream holding 200 real duplicates (relay down past a 1 s window) | projector applied 299, skipped exactly 200; matches |
+
+Planted consumer bugs, each with the crash that exposes it:
+
+| Projector | Crash | Accounts that differ from the ledger |
+|---|---|---|
+| correct | before commit | 0 |
+| **acks before committing** | before commit | **10 of 10**: a batch of 50 was acked, never written, never redelivered |
+| correct | after commit | 0 |
+| **no de-duplication** | after commit | **10 of 10**: a redelivered batch of 50 applied twice |
+
+**What broke:** the first projector did one transaction per event, about five statements each, and fell 2,159 messages behind (median 4 s). Batching 100 events per transaction helped only a little (1.5 s), because the statements still ran one round trip at a time. Pipelining them with `pgx.Batch` (claim all IDs, then one balance update per account with the batch's total, in account order so two projectors can't deadlock) brought the median to 50 ms. I guessed the remaining one-per-event cost was waiting for the WAL flush on each commit; with `synchronous_commit=off` its median only went from 3.2 s to 2.2 s, so the round trips are most of it.
