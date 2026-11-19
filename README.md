@@ -85,3 +85,35 @@ Planted consumer bugs, each with the crash that exposes it:
 | **no de-duplication** | after commit | **10 of 10**: a redelivered batch of 50 applied twice |
 
 **What broke:** the first projector did one transaction per event, about five statements each, and fell 2,159 messages behind (median 4 s). Batching 100 events per transaction helped only a little (1.5 s), because the statements still ran one round trip at a time. Pipelining them with `pgx.Batch` (claim all IDs, then one balance update per account with the batch's total, in account order so two projectors can't deadlock) brought the median to 50 ms. I guessed the remaining one-per-event cost was waiting for the WAL flush on each commit; with `synchronous_commit=off` its median only went from 3.2 s to 2.2 s, so the round trips are most of it.
+
+### Step 4: dead letters, rebuilds, and chaos
+
+**Dead letters.** Two kinds of message can't be processed:
+- **Poison** (can never be valid: not JSON, unknown event type): copied to the `LEDGER_DLQ` stream with headers saying why and where from, then terminated (`TermWithReason`) so JetStream stops redelivering it. If the copy fails, it's negatively acknowledged instead, so it isn't lost.
+- **Keeps failing** (a bug, or a dependency that stays down): negatively acknowledged with a growing delay. After `MaxDeliver` (5) deliveries JetStream gives up and publishes an advisory. Advisories are plain NATS messages, lost if nobody is listening, so a third stream (`LEDGER_ADVISORIES`) stores them, and the projector copies each such event to the dead-letter stream.
+- `ReplayDeadLetters` applies them again once the cause is fixed; it's idempotent like everything else.
+
+**Rebuilds.** Projections are disposable: a projector under a new name replays the stream from the start (the stream keeps everything; no age limit).
+
+Results:
+
+| Test | Result |
+|---|---|
+| A non-JSON message and an unknown event type in the stream | both dead-lettered on first delivery; the other 216 events projected; projection matches |
+| One event fails every time | dead-lettered after 5 deliveries (3.7 s); 215 other events applied meanwhile; only its 2 accounts differ; after the fix, replay applies it and a second replay applies nothing; projection matches |
+| Rebuild 9,480 events into a new projection | 3.1 s (about 3,100 events/s); identical to the ledger and to the live copy, statement row for statement row |
+| Delete the original read model and its consumer, rebuild in place | matches the ledger |
+
+**Chaos** (`TestChaos`): two relays and two projectors (competing for one durable consumer) run as supervised processes, restarted whenever they exit, while 8 writers make transfers. Every 200–700 ms the test does one of: kill a random process; cut every `ledger-*` database connection with `pg_terminate_backend`; restart the NATS server (down 0.2–0.8 s). Then everything must catch up, and the checks must be exact: each committed event in the stream once, projection equal to the ledger, money conserved, one processed row per event.
+
+`go test ./e2e -run TestChaos -args -chaos-seeds 3 -chaos-duration 30s`:
+
+| Seed | Events | Process kills | Connection cuts | NATS restarts | Relay became active | Duplicates dropped by the stream | Redeliveries skipped by projectors | Result |
+|---|---|---|---|---|---|---|---|---|
+| 100 | 27,169 | 26 | 12 | 10 | 21 | 439 | 144 | exact |
+| 101 | 24,427 | 29 | 9 | 14 | 17 | 40 | 152 | exact |
+| 102 | 27,295 | 32 | 9 | 11 | 19 | 236 | 162 | exact |
+
+That's 78,891 events through 87 kills, 30 connection cuts and 35 NATS restarts, with 715 duplicates dropped and 458 redeliveries skipped along the way, and nothing lost or applied twice.
+
+**What broke:** the first chaos run reported 0 takeovers, 0 duplicates and 0 skipped redeliveries, which can't be right with 15 kills. The test was wrong, not the system: the supervisor replaced each process's log buffer after the process had started writing to the original. Fixed; the counts above are real.

@@ -122,9 +122,22 @@ func (s *syncBuf) String() string              { s.mu.Lock(); defer s.mu.Unlock(
 // start runs `ledger <sub>`; crashAt is a LEDGER_CRASH spec or "".
 func (e *env) start(sub, crashAt string, args ...string) *proc {
 	e.t.Helper()
-	cmd := exec.Command(binary, append([]string{sub, "-db", e.dbURL, "-nats", e.natsURL()}, args...)...)
+	return e.startDB(e.dbURL, sub, crashAt, args...)
+}
+
+// startDB is start with a different database URL (for example with an
+// application_name, so its connections can be found and cut).
+func (e *env) startDB(db, sub, crashAt string, args ...string) *proc {
+	e.t.Helper()
+	return e.startLogged(&syncBuf{}, db, sub, crashAt, args...)
+}
+
+// startLogged is startDB writing its output to out.
+func (e *env) startLogged(out *syncBuf, db, sub, crashAt string, args ...string) *proc {
+	e.t.Helper()
+	cmd := exec.Command(binary, append([]string{sub, "-db", db, "-nats", e.natsURL()}, args...)...)
 	cmd.Env = append(os.Environ(), "LEDGER_CRASH="+crashAt)
-	p := &proc{cmd: cmd, out: &syncBuf{}, done: make(chan struct{})}
+	p := &proc{cmd: cmd, out: out, done: make(chan struct{})}
 	cmd.Stdout, cmd.Stderr = p.out, p.out
 	if err := cmd.Start(); err != nil {
 		e.t.Fatal(err)

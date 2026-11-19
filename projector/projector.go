@@ -10,7 +10,7 @@ package projector
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -19,6 +19,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/builtbyshailendra/event-ledger/bus"
@@ -48,8 +49,9 @@ type Projector struct {
 	Fail func(events.Event) error
 	Log  func(format string, args ...any)
 
-	Applied    atomic.Int64
-	Duplicates atomic.Int64
+	Applied      atomic.Int64
+	Duplicates   atomic.Int64
+	DeadLettered atomic.Int64
 }
 
 func (p *Projector) logf(format string, args ...any) {
@@ -94,6 +96,7 @@ func (p *Projector) Run(ctx context.Context) error {
 		}
 	}
 	p.logf("projector %s: running", p.Name)
+	go p.runDeadLetters(ctx)
 	for ctx.Err() == nil {
 		batch, err := cons.Fetch(p.Batch, jetstream.FetchMaxWait(200*time.Millisecond))
 		if err != nil { // NATS unreachable: wait and try again
@@ -260,11 +263,154 @@ func (p *Projector) apply(ctx context.Context, items []item) ([]bool, error) {
 	return applied, tx.Commit(ctx)
 }
 
-// poison handles a message that can never be processed. For now it is
-// terminated so it isn't redelivered; step 5 adds a dead-letter stream.
+// Dead-letter headers.
+const (
+	HeaderDLQConsumer = "Dlq-Consumer"
+	HeaderDLQSeq      = "Dlq-Stream-Seq"
+	HeaderDLQReason   = "Dlq-Reason"
+	HeaderDLQSubject  = "Dlq-Subject"
+)
+
+// DLQSubject is where a consumer's dead letters go.
+func DLQSubject(consumer string) string { return "ledger.dlq." + consumer }
+
+// poison handles a message that can never be processed: no retry will make
+// it decode. It is copied to the dead-letter stream, then terminated so
+// JetStream stops redelivering it. If the copy fails, the message is
+// negatively acknowledged instead, so it isn't lost.
 func (p *Projector) poison(ctx context.Context, msg jetstream.Msg, md *jetstream.MsgMetadata, cause error) error {
+	if err := p.deadLetter(ctx, msg.Subject(), msg.Data(), msg.Headers(), md.Sequence.Stream, cause.Error()); err != nil {
+		_ = msg.NakWithDelay(time.Second)
+		return fmt.Errorf("stream seq %d: dead-letter failed: %w", md.Sequence.Stream, err)
+	}
 	_ = msg.TermWithReason(cause.Error())
-	return fmt.Errorf("stream seq %d: %w", md.Sequence.Stream, errors.Join(errPoison, cause))
+	p.DeadLettered.Add(1)
+	p.logf("projector: stream seq %d dead-lettered: %v", md.Sequence.Stream, cause)
+	return nil
 }
 
-var errPoison = errors.New("poison message terminated")
+func (p *Projector) deadLetter(ctx context.Context, subject string, data []byte, hdr nats.Header, seq uint64, reason string) error {
+	m := nats.NewMsg(DLQSubject(p.Name))
+	m.Data = data
+	for k, v := range hdr {
+		m.Header[k] = v
+	}
+	m.Header.Set(HeaderDLQConsumer, p.Name)
+	m.Header.Set(HeaderDLQSeq, strconv.FormatUint(seq, 10))
+	m.Header.Set(HeaderDLQSubject, subject)
+	m.Header.Set(HeaderDLQReason, reason)
+	_, err := p.JS.PublishMsg(ctx, m, jetstream.WithMsgID(fmt.Sprintf("dlq-%s-%d", p.Name, seq)))
+	return err
+}
+
+// runDeadLetters handles events that failed MaxDeliver times. JetStream
+// stops delivering them and publishes an advisory, which the advisory stream
+// keeps; this copies each such event to the dead-letter stream.
+func (p *Projector) runDeadLetters(ctx context.Context) {
+	var cons jetstream.Consumer
+	var err error
+	for {
+		cons, err = p.JS.CreateOrUpdateConsumer(ctx, bus.AdvisoryStream, jetstream.ConsumerConfig{
+			Durable: "dlq-" + p.Name, AckPolicy: jetstream.AckExplicitPolicy,
+			FilterSubject: bus.AdvisorySubject(p.Name), DeliverPolicy: jetstream.DeliverAllPolicy,
+		})
+		if err == nil {
+			break
+		}
+		if !sleep(ctx, 500*time.Millisecond) {
+			return
+		}
+	}
+	stream, err := p.JS.Stream(ctx, bus.Stream)
+	for err != nil {
+		if !sleep(ctx, 500*time.Millisecond) {
+			return
+		}
+		stream, err = p.JS.Stream(ctx, bus.Stream)
+	}
+	for ctx.Err() == nil {
+		batch, err := cons.Fetch(10, jetstream.FetchMaxWait(500*time.Millisecond))
+		if err != nil {
+			sleep(ctx, 200*time.Millisecond)
+			continue
+		}
+		for adv := range batch.Messages() {
+			var notice struct {
+				StreamSeq  uint64 `json:"stream_seq"`
+				Deliveries uint64 `json:"deliveries"`
+			}
+			if err := json.Unmarshal(adv.Data(), &notice); err != nil {
+				_ = adv.Term()
+				continue
+			}
+			raw, err := stream.GetMsg(ctx, notice.StreamSeq)
+			if err == nil {
+				err = p.deadLetter(ctx, raw.Subject, raw.Data, raw.Header, notice.StreamSeq,
+					fmt.Sprintf("gave up after %d deliveries", notice.Deliveries))
+			}
+			if err != nil {
+				_ = adv.NakWithDelay(time.Second)
+				continue
+			}
+			_ = adv.Ack()
+			p.DeadLettered.Add(1)
+			p.logf("projector: stream seq %d dead-lettered after %d deliveries", notice.StreamSeq, notice.Deliveries)
+		}
+	}
+}
+
+// ReplayDeadLetters applies this consumer's dead letters again, for after
+// the cause is fixed. It is safe to run more than once: events already
+// applied are skipped. It returns how many were applied now, and the ones
+// that still fail.
+func (p *Projector) ReplayDeadLetters(ctx context.Context) (applied int, failed []string, err error) {
+	s, err := p.JS.Stream(ctx, bus.DLQStream)
+	if err != nil {
+		return 0, nil, err
+	}
+	info, err := s.Info(ctx, jetstream.WithSubjectFilter(DLQSubject(p.Name)))
+	if err != nil {
+		return 0, nil, err
+	}
+	total := 0
+	for _, n := range info.State.Subjects {
+		total += int(n)
+	}
+	if total == 0 {
+		return 0, nil, nil
+	}
+	c, err := p.JS.OrderedConsumer(ctx, bus.DLQStream, jetstream.OrderedConsumerConfig{FilterSubjects: []string{DLQSubject(p.Name)}})
+	if err != nil {
+		return 0, nil, err
+	}
+	for seen := 0; seen < total; {
+		batch, err := c.Fetch(100, jetstream.FetchMaxWait(time.Second))
+		if err != nil {
+			return applied, failed, err
+		}
+		got := 0
+		for m := range batch.Messages() {
+			got++
+			seq, _ := strconv.ParseUint(m.Headers().Get(HeaderDLQSeq), 10, 64)
+			ev, err := events.Decode(m.Data())
+			if err != nil {
+				failed = append(failed, fmt.Sprintf("stream seq %d: %v", seq, err))
+				continue
+			}
+			ls, _ := strconv.ParseInt(m.Headers().Get(events.HeaderLedgerSeq), 10, 64)
+			it := item{md: &jetstream.MsgMetadata{Sequence: jetstream.SequencePair{Stream: seq}}, ev: ev, ledgerSeq: ls}
+			ok, err := p.apply(ctx, []item{it})
+			switch {
+			case err != nil:
+				failed = append(failed, fmt.Sprintf("%s: %v", ev.ID, err))
+			case ok[0]:
+				applied++
+			}
+		}
+		if got == 0 {
+			break
+		}
+		seen += got
+	}
+	return applied, failed, nil
+}

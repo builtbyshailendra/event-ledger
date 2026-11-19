@@ -21,7 +21,17 @@ const (
 	// DLQStream holds events a consumer gave up on.
 	DLQStream   = "LEDGER_DLQ"
 	DLQSubjects = "ledger.dlq.>"
+	// AdvisoryStream stores JetStream's "max deliveries reached" notices.
+	// They are plain NATS messages; a stream keeps them until a dead-letter
+	// handler has dealt with each, even if it was down when they were sent.
+	AdvisoryStream   = "LEDGER_ADVISORIES"
+	AdvisorySubjects = "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES." + Stream + ".*"
 )
+
+// AdvisorySubject is where max-delivery notices for one consumer arrive.
+func AdvisorySubject(consumer string) string {
+	return "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES." + Stream + "." + consumer
+}
 
 // Server starts an embedded NATS server with JetStream storing to dir.
 // port 0 picks a free port; pass the same dir and port to restart it.
@@ -74,8 +84,13 @@ func Setup(ctx context.Context, js jetstream.JetStream, dup time.Duration) error
 	}); err != nil {
 		return err
 	}
+	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name: DLQStream, Subjects: []string{DLQSubjects}, Storage: jetstream.FileStorage, Duplicates: dup,
+	}); err != nil {
+		return err
+	}
 	_, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name: DLQStream, Subjects: []string{DLQSubjects}, Storage: jetstream.FileStorage,
+		Name: AdvisoryStream, Subjects: []string{AdvisorySubjects}, Storage: jetstream.FileStorage,
 	})
 	return err
 }
