@@ -15,3 +15,41 @@ Built pairing with Claude Code, as a learning project. Runs on this laptop only:
 - Two wrong modes are kept on purpose for later comparison: **dual write** (commit, then publish) and **publish first** (publish, then commit).
 
 Tests (against a fresh database on the local cluster each time): a refused transfer leaves neither state nor event; a command retried three times applies once; a crash before commit leaves nothing and the retry works; 8 workers × 400 random transfers among 20 accounts (2,743 accepted, 457 refused for funds) at 861 commands/s, with no deadlocks, money conserved, one event per accepted transfer, and every account's versions 1, 2, 3... without gaps.
+
+### Step 2: the relay, and what it takes to publish each event once
+
+`relay/` reads unpublished outbox rows in id order, publishes them to the `LEDGER` stream with the event ID as JetStream's message ID (`Nats-Msg-Id`), waits for the stream's acknowledgments, then marks the acknowledged rows as published.
+
+- **At-least-once by design:** publish, then mark. A crash in between means those rows go out again.
+- **Deduplication** by message ID drops the resent copies, but only within the stream's window (2 minutes by default).
+- **LISTEN/NOTIFY:** the write transaction calls `pg_notify`, delivered only on commit, so the relay wakes immediately; polling is the fallback.
+- **One active relay:** a session-level advisory lock. If the active relay dies, its connection closes, PostgreSQL releases the lock and the standby takes over. The lock isn't a fence (a paused relay could still publish after losing it); deduplication makes that harmless.
+- **Crash points** (`crash/`): `LEDGER_CRASH=relay.after-publish:2` makes the process exit with code 137 at the second time it reaches that point, with no cleanup, like `kill -9`. The tests run the relay as a separate process (`cmd/ledger`) and kill it this way.
+- **The checker** (`check/`) reads the whole stream back and compares it with `ledger.commands`: missing (committed, never published), phantom (published, never committed), duplicates, and per-account version gaps.
+
+Results, each on a fresh database and NATS server:
+
+| Test | Result |
+|---|---|
+| 2,000 concurrent transfers with the relay running (LISTEN/NOTIFY) | 1,902 events, each once; commit-to-stream p50 8.8 ms, p99 61 ms |
+| Same, polling every 500 ms instead | p50 289 ms, p99 534 ms |
+| Relay killed before publishing (2nd batch of 200) | 200 in the stream; restart publishes the rest; 0 duplicates |
+| Killed halfway through the batch | 300 in the stream; restart resends, stream drops 100 duplicates |
+| Killed after publishing, before marking | 400 in the stream; stream drops 200 resent duplicates |
+| Killed after marking | 400 in the stream; nothing resent |
+| Two relays, the active one killed mid-stream | standby takes over; 1,419 events, each once |
+| Dedup window 1 s, relay down 1.5 s after publishing | **200 events stored twice**: the window had passed |
+
+In every crash case the final stream holds each committed event exactly once, until the deduplication window is exceeded. That last row is why consumers must deduplicate too (step 3).
+
+**Two classic bugs, reproduced:**
+- **A relay that remembers "the highest id I published"** (`WHERE id > last`) loses events. Ids are assigned at insert, not at commit. In the test, transaction `slow` inserts first (lower id) and waits; `fast` commits and is published; then `slow` commits, and the cursor relay never looks back: `slow` is missing forever. Scanning `WHERE published_at IS NULL` publishes it.
+- **Dual writes.** 300 transfers, a simulated crash at the worst moment in every 10th:
+
+  | Mode | Committed | In the stream | Result |
+  |---|---|---|---|
+  | commit, then publish | 320 | 290 | **30 changes no one heard about** |
+  | publish, then commit | 290 | 320 | **30 events about changes that never happened** |
+  | outbox | 290 | 290 | each once |
+
+  A retry doesn't save dual-write mode: the command is already recorded, so the retry is a no-op and the event is still never sent.
