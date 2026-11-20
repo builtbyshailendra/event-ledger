@@ -1,5 +1,7 @@
 # event-ledger
 
+[![ci](https://github.com/builtbyshailendra/event-ledger/actions/workflows/ci.yml/badge.svg)](https://github.com/builtbyshailendra/event-ledger/actions/workflows/ci.yml)
+
 A small double-entry ledger in PostgreSQL that publishes every change as an event to NATS JetStream, through a transactional outbox, to consumers that build read models. The point is the guarantees: no change without its event, no event without its change, and no event applied twice, through crashes at every step.
 
 Built pairing with Claude Code, as a learning project. Runs on this laptop only: PostgreSQL 16 (local test cluster, port 5433) and an embedded NATS server (nats-server 2.15, nats.go 1.56, pgx 5.13, Go 1.27).
@@ -168,4 +170,4 @@ projection check: 0 accounts differ from the ledger
 - **The outbox is never cleaned up.** Real systems delete or partition old published rows.
 - **The stream keeps everything** so projections can be rebuilt. At scale that needs snapshots or compaction.
 - **The relay's advisory lock isn't a fence.** A paused relay can publish after losing it; deduplication makes that harmless here.
-- No CI, not published.
+- CI (badge above) was added when the project was published, 20 Nov 2026, after the build.
